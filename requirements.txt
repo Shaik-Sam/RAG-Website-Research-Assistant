@@ -1,0 +1,18 @@
+streamlit # (frontend development)
+python-dotenv #(to save and secure API key)
+langchain
+langchain-community #(to get data using url)
+langchain-text-splitters #(divide text into subtext)
+langchain-chroma #(connect with chromaDB with langchain)
+langchain-Huggingface #(to connect langchain and huggingface)
+langchain-groq
+chromaDB
+unstructured 
+tiktoken #(no of words in one frame)
+sentence-transformers
+torch
+transformers
+pydantic
+requests
+beautifulsoup4
+lxml
