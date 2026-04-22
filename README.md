@@ -27,7 +27,15 @@ This project enables users to extract and query information from multiple URLs s
    ```bash
    git clone (https://github.com/Shaik-Sam/RAG-Website-Research-Assistant.git)
 
-2. **Install dependencies:**  ```bash pip install -r requirements.txt
-3. **Environment Variables:**
-Create a .env file in the root directory and add your API key: ```bash GROQ_API_KEY=your_groq_api_key_here
-4. **Run the App:** ```bash  streamlit run main.py
+2. **Install dependencies:**
+    ```bash
+     pip install -r requirements.txt
+3. **Environment Variables:** Create a .env file in the root directory and add your API key:
+```bash
+GROQ_API_KEY=your_groq_api_key_here
+
+4. **Run the App:**
+```bash
+  streamlit run main.py
+
+
