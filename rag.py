@@ -2,12 +2,14 @@ import os
 from uuid import uuid4
 from dotenv import load_dotenv
 from pathlib import Path
+import requests
+from bs4 import BeautifulSoup
 from groq import Groq
-from langchain_community.document_loaders import UnstructuredURLLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_chroma import Chroma
 from langchain_groq import ChatGroq
 from langchain_huggingface.embeddings import HuggingFaceEmbeddings
+from langchain_core.documents import Document
 
 load_dotenv()
 
@@ -125,29 +127,88 @@ def process_urls(urls):
     vector_store.reset_collection()
 
     yield "loading the data from URLs"
-    loader = UnstructuredURLLoader(
-        urls=urls,
-        headers={"User-Agent": USER_AGENT},
-        continue_on_failure=True,
-    )
-    documents = loader.load()
 
-    if not documents or all(len(doc.page_content.strip()) < 200 for doc in documents):
+    documents = []
+
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+    }
+
+    for url in urls:
+        try:
+            response = requests.get(
+                url,
+                headers=headers,
+                timeout=30
+            )
+
+            response.raise_for_status()
+
+            soup = BeautifulSoup(
+                response.text,
+                "html.parser"
+            )
+
+            for element in soup.find_all(
+                ["script", "style", "noscript", "svg"]
+            ):
+                element.decompose()
+
+            content = soup.find("article")
+
+            if content is None:
+                content = soup.find("main")
+
+            if content is None:
+                content = soup.body
+
+            if content is None:
+                continue
+
+            text = content.get_text(
+                separator="\n",
+                strip=True
+            )
+
+            text = "\n".join(
+                line.strip()
+                for line in text.splitlines()
+                if line.strip()
+            )
+
+            text = strip_comment_section(text)
+
+            if len(text) >= 200:
+                documents.append(
+                    Document(
+                        page_content=text,
+                        metadata={
+                            "source": url
+                        }
+                    )
+                )
+
+        except Exception:
+            continue
+
+    if not documents:
         raise RuntimeError(
-            "Could not extract usable content from the provided URL(s). "
-            "The site may be blocking automated requests."
+            "Could not extract usable content from the provided URL(s)."
         )
 
-    for doc in documents:
-        doc.page_content = strip_comment_section(doc.page_content)
-
     full_page_text = "\n\n".join(
-        f"[Source: {doc.metadata.get('source', urls[0])}]\n{doc.page_content}"
+        f"[Source: {doc.metadata.get('source', '')}]\n{doc.page_content}"
         for doc in documents
     )
-    full_page_sources = list(urls)
+
+    full_page_sources = [
+        doc.metadata.get("source", "")
+        for doc in documents
+    ]
 
     yield "Splitting data into small chunks..."
+
     splitter = RecursiveCharacterTextSplitter(
         separators=["\n\n", "\n", ".", " "],
         chunk_size=CHUNK_SIZE,
@@ -156,12 +217,15 @@ def process_urls(urls):
 
     docs = splitter.split_documents(documents)
 
-    for i, doc in enumerate(docs):
-        doc.metadata["source"] = urls[i % len(urls)]
+    for doc in docs:
+        doc.metadata["source"] = doc.metadata.get("source", "")
 
     yield "Adding doc chunks into chromaDB..."
 
-    ids = [str(uuid4()) for _ in range(len(docs))]
+    ids = [
+        str(uuid4())
+        for _ in range(len(docs))
+    ]
 
     vector_store.add_documents(
         docs,
