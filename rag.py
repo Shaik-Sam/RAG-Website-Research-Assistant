@@ -1,0 +1,211 @@
+import os
+from uuid import uuid4
+from dotenv import load_dotenv
+from pathlib import Path
+from groq import Groq
+from langchain_community.document_loaders import UnstructuredURLLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_chroma import Chroma
+from langchain_groq import ChatGroq
+from langchain_huggingface.embeddings import HuggingFaceEmbeddings
+
+load_dotenv()
+
+CHUNK_SIZE = 1500
+CHUNK_OVERLAP = 200
+MAX_DIRECT_CONTEXT_CHARS = 20000
+EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+VECTORSTORE_DIR = Path(__file__).parent / "resources/vectorstore"
+COLLECTION_NAME = "web_assistant"
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
+COMMENT_SECTION_MARKERS = [
+    "Leave a Reply",
+    "Leave a Comment",
+    "Post Comment",
+    "Your email address will not be published",
+]
+llm = None
+vector_store = None
+full_page_text = ""
+full_page_sources = []
+
+def get_available_model(api_key):
+    client = Groq(api_key=api_key)
+    models = client.models.list()
+
+    preferred_models = [
+        "llama-3.3-70b-versatile",
+        "llama-3.1-8b-instant",
+        "openai/gpt-oss-20b",
+        "openai/gpt-oss-120b"
+    ]
+
+    available_models = [
+        model.id
+        for model in models.data
+        if getattr(model, "active", True)
+    ]
+
+    for model in preferred_models:
+        if model in available_models:
+            return model
+
+    excluded = [
+        "whisper",
+        "guard",
+        "tts",
+        "speech",
+        "distil-whisper"
+    ]
+
+    for model in available_models:
+        if not any(
+            word in model.lower()
+            for word in excluded
+        ):
+            return model
+
+    raise RuntimeError(
+        "No compatible Groq text generation model is available for this API key."
+    )
+
+def strip_comment_section(text):
+    lowered = text.lower()
+    cut_index = len(text)
+
+    for marker in COMMENT_SECTION_MARKERS:
+        idx = lowered.find(marker.lower())
+        if idx != -1:
+            cut_index = min(cut_index, idx)
+
+    return text[:cut_index].strip()
+
+def initialize_components():
+    global llm, vector_store
+
+    api_key = os.getenv("GROQ_API_KEY")
+
+    if not api_key:
+        raise RuntimeError(
+            "GROQ_API_KEY is missing from the .env file."
+        )
+
+    if llm is None:
+        model_name = get_available_model(api_key)
+
+        llm = ChatGroq(
+            model=model_name,
+            temperature=0.9,
+            max_tokens=1000,
+            api_key=api_key
+        )
+
+    if vector_store is None:
+        embeddings = HuggingFaceEmbeddings(
+            model_name=EMBEDDING_MODEL,
+            model_kwargs={"trust_remote_code": True}
+        )
+
+        vector_store = Chroma(
+            collection_name=COLLECTION_NAME,
+            embedding_function=embeddings,
+            persist_directory=str(VECTORSTORE_DIR)
+        )
+
+def process_urls(urls):
+    global full_page_text, full_page_sources
+
+    yield "initializing components..."
+    initialize_components()
+
+    yield "Resetting vector store"
+    vector_store.reset_collection()
+
+    yield "loading the data from URLs"
+    loader = UnstructuredURLLoader(
+        urls=urls,
+        headers={"User-Agent": USER_AGENT},
+        continue_on_failure=True,
+    )
+    documents = loader.load()
+
+    if not documents or all(len(doc.page_content.strip()) < 200 for doc in documents):
+        raise RuntimeError(
+            "Could not extract usable content from the provided URL(s). "
+            "The site may be blocking automated requests."
+        )
+
+    for doc in documents:
+        doc.page_content = strip_comment_section(doc.page_content)
+
+    full_page_text = "\n\n".join(
+        f"[Source: {doc.metadata.get('source', urls[0])}]\n{doc.page_content}"
+        for doc in documents
+    )
+    full_page_sources = list(urls)
+
+    yield "Splitting data into small chunks..."
+    splitter = RecursiveCharacterTextSplitter(
+        separators=["\n\n", "\n", ".", " "],
+        chunk_size=CHUNK_SIZE,
+        chunk_overlap=CHUNK_OVERLAP
+    )
+
+    docs = splitter.split_documents(documents)
+
+    for i, doc in enumerate(docs):
+        doc.metadata["source"] = urls[i % len(urls)]
+
+    yield "Adding doc chunks into chromaDB..."
+
+    ids = [str(uuid4()) for _ in range(len(docs))]
+
+    vector_store.add_documents(
+        docs,
+        ids=ids
+    )
+
+    yield "Vector store successfully updated"
+
+def generate_answer(query):
+    if not vector_store:
+        raise RuntimeError("Vector database is empty")
+
+    if full_page_text and len(full_page_text) <= MAX_DIRECT_CONTEXT_CHARS:
+        content = full_page_text
+        sources = "\n".join(full_page_sources)
+    else:
+        retriever = vector_store.as_retriever(search_kwargs={"k": 10})
+        docs = retriever.invoke(query)
+        content = "\n\n".join([doc.page_content for doc in docs])
+        sources = "\n".join(
+            list(
+                set(
+                    [
+                        doc.metadata.get("source", "")
+                        for doc in docs
+                    ]
+                )
+            )
+        )
+
+    prompt = f"""
+    You are a helpful assistant answering questions strictly from the content below,
+    which was scraped from one or more web pages. The content may contain a numbered list.
+    If the question refers to a position in a list (first, second, last, number N) or asks
+    for a count, use the numbering exactly as it appears in the content to answer precisely.
+    If the answer is not present in the content, say "I don't know". Don't hallucinate.
+
+    content:
+    {content}
+
+    question:
+    {query}
+    """
+
+    response = llm.invoke(prompt)
+
+    return response.content.strip(), sources
