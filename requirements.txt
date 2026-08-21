@@ -20,3 +20,6 @@ groq
 streamlit
 torch
 torchvision
+requests
+beautifulsoup4
+lxml
