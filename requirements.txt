@@ -17,3 +17,6 @@ requests
 beautifulsoup4
 lxml
 groq
+streamlit
+torch
+torchvision
