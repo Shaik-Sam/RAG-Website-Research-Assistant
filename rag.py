@@ -1,12 +1,10 @@
 import os
-import re
 from uuid import uuid4
+from dotenv import load_dotenv
 from pathlib import Path
-
 import requests
 import streamlit as st
 from bs4 import BeautifulSoup
-from dotenv import load_dotenv
 from groq import Groq
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_chroma import Chroma
@@ -15,16 +13,13 @@ from langchain_huggingface.embeddings import HuggingFaceEmbeddings
 
 load_dotenv()
 
-CHUNK_SIZE = 1500
-CHUNK_OVERLAP = 200
+CHUNK_SIZE = 1000
 EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
-VECTORSTORE_DIR = Path(__file__).parent / "resources" / "vectorstore"
+VECTORSTORE_DIR = Path(__file__).parent / "resources/vectorstore"
 COLLECTION_NAME = "web_assistant"
 
 llm = None
 vector_store = None
-full_page_text = ""
-full_page_sources = []
 
 
 def get_groq_api_key():
@@ -41,9 +36,7 @@ def get_groq_api_key():
     except Exception:
         pass
 
-    raise RuntimeError(
-        "GROQ_API_KEY is not configured. Add it to Streamlit Cloud Secrets."
-    )
+    raise RuntimeError("GROQ_API_KEY is not configured.")
 
 
 def get_available_model(api_key):
@@ -72,7 +65,7 @@ def get_available_model(api_key):
         "guard",
         "tts",
         "speech",
-        "distil-whisper"
+        "audio"
     ]
 
     for model in available_models:
@@ -98,17 +91,15 @@ def initialize_components():
 
         llm = ChatGroq(
             model=model_name,
-            temperature=0.2,
-            max_tokens=2000,
+            temperature=0.9,
+            max_tokens=1000,
             api_key=api_key
         )
 
     if vector_store is None:
         embeddings = HuggingFaceEmbeddings(
             model_name=EMBEDDING_MODEL,
-            model_kwargs={
-                "trust_remote_code": True
-            }
+            model_kwargs={"trust_remote_code": True}
         )
 
         VECTORSTORE_DIR.mkdir(
@@ -129,19 +120,13 @@ def load_webpage(url):
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "
             "Chrome/124.0.0.0 Safari/537.36"
-        ),
-        "Accept": (
-            "text/html,application/xhtml+xml,"
-            "application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"
-        ),
-        "Accept-Language": "en-US,en;q=0.9"
+        )
     }
 
     response = requests.get(
         url,
         headers=headers,
-        timeout=30,
-        allow_redirects=True
+        timeout=30
     )
 
     response.raise_for_status()
@@ -156,29 +141,25 @@ def load_webpage(url):
             "script",
             "style",
             "noscript",
-            "svg",
-            "iframe",
-            "nav",
-            "footer",
-            "header"
+            "svg"
         ]
     ):
         element.decompose()
 
-    main = soup.find("article")
+    content = soup.find("article")
 
-    if main is None:
-        main = soup.find("main")
+    if content is None:
+        content = soup.find("main")
 
-    if main is None:
-        main = soup.body
+    if content is None:
+        content = soup.body
 
-    if main is None:
+    if content is None:
         raise RuntimeError(
             "No readable content was found on the webpage."
         )
 
-    text = main.get_text(
+    text = content.get_text(
         separator="\n",
         strip=True
     )
@@ -186,78 +167,60 @@ def load_webpage(url):
     lines = []
 
     for line in text.splitlines():
-        line = re.sub(
-            r"\s+",
-            " ",
-            line
-        ).strip()
+        line = " ".join(
+            line.split()
+        )
 
         if line:
             lines.append(line)
 
     text = "\n".join(lines)
 
-    if len(text) < 100:
+    if len(text.strip()) < 100:
         raise RuntimeError(
-            "The webpage returned insufficient readable content."
+            "The webpage did not return enough readable content."
         )
 
     return text
 
 
 def process_urls(urls):
-    global full_page_text
-    global full_page_sources
-
-    yield "Initializing components..."
+    yield "initializing components..."
 
     initialize_components()
 
-    yield "Resetting vector store..."
+    yield "Resetting vector store"
 
     vector_store.reset_collection()
 
-    yield "Loading data from URLs..."
+    yield "loading the data from URLs"
 
-    loaded_pages = []
+    documents = []
 
     for url in urls:
         try:
             text = load_webpage(url)
 
-            loaded_pages.append(
-                {
-                    "url": url,
-                    "text": text
+            from langchain_core.documents import Document
+
+            document = Document(
+                page_content=text,
+                metadata={
+                    "source": url
                 }
             )
 
-            yield f"Successfully loaded: {url}"
-
-        except requests.exceptions.RequestException as error:
-            raise RuntimeError(
-                f"Could not access {url}: {error}"
-            )
+            documents.append(document)
 
         except Exception as error:
             raise RuntimeError(
-                f"Could not extract content from {url}: {error}"
+                f"Could not load content from {url}: {error}"
             )
 
-    if not loaded_pages:
+    if not documents:
         raise RuntimeError(
-            "No webpage content could be loaded."
+            "Could not extract usable content from the provided URL(s)."
         )
-
-    full_page_sources = [
-        page["url"]
-        for page in loaded_pages
-    ]
-
-    full_page_text = "\n\n".join(
-        f"[Source: {page['url']}]\n{page['text']}"
-        for page in loaded_pages
-    )
 
     yield "Splitting data into small chunks..."
 
@@ -265,226 +228,45 @@ def process_urls(urls):
         separators=[
             "\n\n",
             "\n",
-            ". ",
             ".",
-            " ",
-            ""
+            " "
         ],
-        chunk_size=CHUNK_SIZE,
-        chunk_overlap=CHUNK_OVERLAP
+        chunk_size=CHUNK_SIZE
     )
 
-    docs = []
+    docs = splitter.split_documents(
+        documents
+    )
 
-    for page in loaded_pages:
-        page_docs = splitter.create_documents(
-            [page["text"]]
-        )
+    for i, doc in enumerate(docs):
+        doc.metadata["source"] = urls[
+            i % len(urls)
+        ]
 
-        for index, doc in enumerate(page_docs):
-            doc.metadata["source"] = page["url"]
-            doc.metadata["chunk_index"] = index
-            docs.append(doc)
-
-    if not docs:
-        raise RuntimeError(
-            "No document chunks were created."
-        )
-
-    yield f"Created {len(docs)} document chunks..."
+    yield "Adding doc chunks into chromaDB..."
 
     ids = [
         str(uuid4())
-        for _ in docs
+        for _ in range(len(docs))
     ]
 
-    yield "Adding document chunks into ChromaDB..."
-
     vector_store.add_documents(
-        documents=docs,
+        docs,
         ids=ids
     )
 
-    yield "Vector store successfully updated."
+    yield "Vector store successfully updated"
 
 
-def get_all_stored_documents():
-    data = vector_store.get(
-        include=[
-            "documents",
-            "metadatas"
-        ]
-    )
-
-    documents = data.get(
-        "documents",
-        []
-    )
-
-    metadatas = data.get(
-        "metadatas",
-        []
-    )
-
-    result = []
-
-    for document, metadata in zip(
-        documents,
-        metadatas
-    ):
-        result.append(
-            {
-                "text": document,
-                "metadata": metadata or {}
-            }
+def generate_answer(query):
+    if vector_store is None:
+        raise RuntimeError(
+            "Vector database is empty"
         )
-
-    return result
-
-
-def get_requested_number(query):
-    query_lower = query.lower()
-
-    numeric_match = re.search(
-        r"\b(?:quote|item|number)\s*#?\s*(\d+)\b",
-        query_lower
-    )
-
-    if numeric_match:
-        return int(
-            numeric_match.group(1)
-        )
-
-    ordinal_numbers = {
-        "first": 1,
-        "second": 2,
-        "third": 3,
-        "fourth": 4,
-        "fifth": 5,
-        "sixth": 6,
-        "seventh": 7,
-        "eighth": 8,
-        "ninth": 9,
-        "tenth": 10,
-        "eleventh": 11,
-        "twelfth": 12,
-        "thirteenth": 13,
-        "fourteenth": 14,
-        "fifteenth": 15,
-        "sixteenth": 16,
-        "seventeenth": 17,
-        "eighteenth": 18,
-        "nineteenth": 19,
-        "twentieth": 20
-    }
-
-    for word, number in ordinal_numbers.items():
-        if re.search(
-            rf"\b{word}\b",
-            query_lower
-        ):
-            return number
-
-    return None
-
-
-def extract_numbered_quote(query):
-    if (
-        "quote" not in query.lower()
-        and "quotes" not in query.lower()
-    ):
-        return None
-
-    number = get_requested_number(query)
-
-    if number is None:
-        return None
-
-    pattern = re.compile(
-        rf"(?m)^\s*{number}\s*[\.\):-]\s*(.+?)(?=\n\s*\d+\s*[\.\):-]|\Z)",
-        re.DOTALL
-    )
-
-    match = pattern.search(
-        full_page_text
-    )
-
-    if match:
-        quote = match.group(1).strip()
-
-        if quote:
-            return f"{number}. {quote}"
-
-    return None
-
-
-def extract_first_numbered_item():
-    pattern = re.compile(
-        r"(?m)^\s*1\s*[\.\):-]\s*(.+?)(?=\n\s*2\s*[\.\):-]|\Z)",
-        re.DOTALL
-    )
-
-    match = pattern.search(
-        full_page_text
-    )
-
-    if match:
-        quote = match.group(1).strip()
-
-        if quote:
-            return f"1. {quote}"
-
-    return None
-
-
-def retrieve_documents(query):
-    stored_documents = get_all_stored_documents()
-
-    if not stored_documents:
-        return []
-
-    direct_quote = extract_numbered_quote(
-        query
-    )
-
-    if direct_quote:
-        return [
-            {
-                "text": direct_quote,
-                "metadata": {
-                    "source": full_page_sources[0]
-                    if full_page_sources
-                    else ""
-                }
-            }
-        ]
-
-    if (
-        "first quote" in query.lower()
-        or "first quotation" in query.lower()
-        or "quote number 1" in query.lower()
-        or "quote #1" in query.lower()
-    ):
-        first_quote = extract_first_numbered_item()
-
-        if first_quote:
-            return [
-                {
-                    "text": first_quote,
-                    "metadata": {
-                        "source": full_page_sources[0]
-                        if full_page_sources
-                        else ""
-                    }
-                }
-            ]
 
     retriever = vector_store.as_retriever(
-        search_type="mmr",
         search_kwargs={
-            "k": 8,
-            "fetch_k": 20,
-            "lambda_mult": 0.7
+            "k": 6
         }
     )
 
@@ -492,112 +274,58 @@ def retrieve_documents(query):
         query
     )
 
-    results = []
-
-    for doc in docs:
-        results.append(
-            {
-                "text": doc.page_content,
-                "metadata": doc.metadata
-            }
-        )
-
-    return results
-
-
-def build_context(documents):
-    context_parts = []
-
-    for index, document in enumerate(
-        documents,
-        start=1
-    ):
-        context_parts.append(
-            f"""
-SOURCE {index}
-URL: {document["metadata"].get("source", "")}
-
-{document["text"]}
-"""
-        )
-
-    return "\n".join(
-        context_parts
-    )
-
-
-def generate_answer(query):
-    initialize_components()
-
-    documents = retrieve_documents(
-        query
-    )
-
-    if not documents:
+    if not docs:
         return (
-            "I could not find relevant information in the processed webpage.",
-            "\n".join(full_page_sources)
+            "I don't know.",
+            ""
         )
 
-    context = build_context(
-        documents
+    content = "\n\n".join(
+        [
+            doc.page_content
+            for doc in docs
+        ]
     )
 
     prompt = f"""
-You are a website research assistant.
+You are a helpful assistant.
 
-Answer the user's question using only the website content provided below.
+Answer the question using the content given below.
 
-Rules:
-1. Answer the question directly.
-2. Do not invent information.
-3. If the answer exists in the content, provide it.
-4. If the user asks for a numbered quote, return the requested quote exactly as it appears in the content.
-5. If the user asks for the first quote, return quote number 1.
-6. If the user asks for a specific quote number, return that numbered quote.
-7. If the answer genuinely cannot be found, say that it was not found in the provided webpage.
-8. Never answer with "0" unless the webpage itself explicitly contains 0 as the answer.
-9. Preserve important wording from quotes.
+If the answer is present in the content, provide the answer clearly.
 
-WEBSITE CONTENT:
+If the user asks for a specific item, quote, number, person, fact, or detail, find it from the provided content.
 
-{context}
+If the answer is not present, say "I don't know".
 
-USER QUESTION:
+Do not hallucinate or invent information.
 
+content:
+{content}
+
+question:
 {query}
-
-ANSWER:
 """
 
     response = llm.invoke(
         prompt
     )
 
-    answer = response.content.strip()
-
-    if not answer:
-        answer = (
-            "I could not generate an answer from the provided webpage."
-        )
-
-    sources = []
-
-    for document in documents:
-        source = document["metadata"].get(
-            "source",
-            ""
-        )
-
-        if source and source not in sources:
-            sources.append(
-                source
+    sources = "\n".join(
+        list(
+            set(
+                [
+                    doc.metadata.get(
+                        "source",
+                        ""
+                    )
+                    for doc in docs
+                ]
             )
-
-    if not sources:
-        sources = full_page_sources
+        )
+    )
 
     return (
-        answer,
-        "\n".join(sources)
+        response.content.strip(),
+        sources
     )
