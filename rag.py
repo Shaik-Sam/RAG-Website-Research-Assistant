@@ -2,8 +2,10 @@ import os
 from uuid import uuid4
 from dotenv import load_dotenv
 from pathlib import Path
+import requests
+from bs4 import BeautifulSoup
 from groq import Groq
-from langchain_community.document_loaders import UnstructuredURLLoader
+from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_chroma import Chroma
 from langchain_groq import ChatGroq
@@ -17,10 +19,14 @@ MAX_DIRECT_CONTEXT_CHARS = 20000
 EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 VECTORSTORE_DIR = Path(__file__).parent / "resources/vectorstore"
 COLLECTION_NAME = "web_assistant"
-USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-)
+REQUEST_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+}
 COMMENT_SECTION_MARKERS = [
     "Leave a Reply",
     "Leave a Comment",
@@ -31,6 +37,13 @@ llm = None
 vector_store = None
 full_page_text = ""
 full_page_sources = []
+
+def get_groq_api_key():
+    try:
+        import _snowflake
+        return _snowflake.get_generic_secret_string("groq_api_key")
+    except ImportError:
+        return os.getenv("GROQ_API_KEY")
 
 def get_available_model(api_key):
     client = Groq(api_key=api_key)
@@ -83,14 +96,38 @@ def strip_comment_section(text):
 
     return text[:cut_index].strip()
 
+def fetch_url_as_document(url):
+    try:
+        response = requests.get(url, headers=REQUEST_HEADERS, timeout=20)
+    except requests.exceptions.RequestException as exc:
+        raise RuntimeError(f"Failed to reach {url}: {exc}") from exc
+
+    if response.status_code != 200:
+        raise RuntimeError(
+            f"Failed to load {url}: server returned HTTP {response.status_code}. "
+            "The site is likely blocking automated requests from this server."
+        )
+
+    soup = BeautifulSoup(response.text, "lxml")
+
+    for tag in soup(["script", "style", "noscript", "svg"]):
+        tag.decompose()
+
+    raw_text = soup.get_text(separator="\n")
+    lines = [line.strip() for line in raw_text.splitlines()]
+    text = "\n".join(line for line in lines if line)
+
+    return Document(page_content=text, metadata={"source": url})
+
 def initialize_components():
     global llm, vector_store
 
-    api_key = os.getenv("GROQ_API_KEY")
+    api_key = get_groq_api_key()
 
     if not api_key:
         raise RuntimeError(
-            "GROQ_API_KEY is missing from the .env file."
+            "GROQ_API_KEY is missing. Set it in .env locally, or as a "
+            "secret named GROQ_API_KEY in your deployment platform."
         )
 
     if llm is None:
@@ -125,17 +162,14 @@ def process_urls(urls):
     vector_store.reset_collection()
 
     yield "loading the data from URLs"
-    loader = UnstructuredURLLoader(
-        urls=urls,
-        headers={"User-Agent": USER_AGENT},
-        continue_on_failure=True,
-    )
-    documents = loader.load()
+    documents = []
+    for url in urls:
+        documents.append(fetch_url_as_document(url))
 
     if not documents or all(len(doc.page_content.strip()) < 200 for doc in documents):
         raise RuntimeError(
             "Could not extract usable content from the provided URL(s). "
-            "The site may be blocking automated requests."
+            "The page loaded but returned little or no readable text."
         )
 
     for doc in documents:
